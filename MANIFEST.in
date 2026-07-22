@@ -1,0 +1,2 @@
+include pybigcat/VERSION.txt
+include pybigcat/logging_config.ini

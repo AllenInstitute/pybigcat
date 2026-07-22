@@ -1,0 +1,17 @@
+pandas
+numpy
+scipy>=1.7.0
+anndata==0.8.0
+scanpy
+scikit-misc
+scikit-learn
+statsmodels
+h5py
+tqdm
+python-igraph
+psutil
+Welford
+annoy
+networkx
+leidenalg==0.8.4
+python-louvain

@@ -1,0 +1,669 @@
+from typing import Any, Tuple, Dict, List, Optional, Set, Literal
+import time
+import anndata as ad
+import pandas as pd
+import numpy as np
+from scipy.spatial.distance import cdist
+import logging
+from collections import defaultdict
+import warnings
+import pybigcat as tc
+from pybigcat.markers import select_marker_genes
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_THRESHOLDS = {
+    'q1_thresh': 0.5,
+    'q2_thresh': None,
+    'cluster_size_thresh': 6,
+    'qdiff_thresh': 0.7,
+    'padj_thresh': 0.05,
+    'lfc_thresh': 1.0,
+    'score_thresh': 150,
+    'low_thresh': 1,
+    'min_genes': 5
+}
+
+
+def merge_clusters(
+        adata_norm: ad.AnnData,
+        adata_reduced: ad.AnnData,
+        cluster_assignments: Dict[Any, List],
+        cluster_by_obs: np.ndarray,
+        thresholds: Dict[str, Any] = DEFAULT_THRESHOLDS,
+        k: Optional[int] = 2,
+        de_method: Optional[str] = 'ebayes',
+        n_markers: Optional[int] = 20,
+        chunk_size: Optional[int] = None,
+        return_markers_df: Optional[bool] = False,
+        n_jobs: Optional[int] = 1
+) -> Tuple[Dict[Any, np.ndarray], Set]:
+    """
+    Merge clusters based on size and differential gene expression score
+
+    1. merge small clusters
+    2. merge clusters based by differential gene expression score
+
+    Parameters
+    ----------
+    adata_norm:
+        AnnData object of normalized data
+    adata_reduced:
+        AnnData object in reduced space
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    cluster_by_obs:
+        array of cells with cluster value
+    thresholds:
+        threshold for de calculation
+    k:
+        number of cluster neighbors
+    de_method:
+        method used for de calculation
+    n_markers:
+        number of marker genes to select from up and down de genes
+        if 0 or None will skip
+    chunk_size:
+        number of observations to process in a single chunk
+    return_markers_df:
+        return markers as a dataframe
+    n_jobs:
+        number of jobs to run in parallel
+
+    Returns
+    -------
+    cluster_assignments:
+        updated mapping of cluster assignments
+    markers:
+        if select_markers, set of genes that differentiate clusters, or empty set
+    """
+    if len(cluster_assignments.keys()) == 1:
+        return cluster_assignments.copy()
+
+    # Calculate cluster means on reduced space
+    logger.info("Computing reduced cluster means")
+    tic = time.perf_counter()
+    cl_means_reduced, _, _ = tc.get_cluster_means(adata_reduced,
+                                               cluster_assignments,
+                                               cluster_by_obs,
+                                               chunk_size,
+                                               low_th=thresholds['low_thresh'])
+    logger.info(f'Completed reduced cluster means')
+    toc = time.perf_counter()
+    logger.info(f'Reduced Cluster Means Elapsed Time: {toc - tic}')
+
+
+    # Merge small clusters
+    min_cluster_size = thresholds['cluster_size_thresh']
+    cluster_assignments_merge = cluster_assignments.copy()
+    
+    logger.info("Merging small clusters")
+    tic = time.perf_counter()
+    merge_small_clusters(cl_means_reduced, cluster_assignments_merge, min_cluster_size)
+    logger.info(f'Completed merging small clusters')
+    toc = time.perf_counter()
+    logger.info(f'Small Clusters Elapsed Time: {toc - tic}')
+
+    # Create new cluster_by_obs based on updated cluster assignments
+    cluster_by_obs = np.zeros((adata_norm.shape[0],))
+    for cl_id, idxs in cluster_assignments_merge.items():
+        cluster_by_obs[idxs] = cl_id
+
+    # Calculate cluster means on normalized data
+    logger.info("Computing Cluster Means")
+    tic = time.perf_counter()
+    cl_means, present_cl_means, cl_vars = tc.get_cluster_means(adata_norm,
+                                                      cluster_assignments_merge,
+                                                      cluster_by_obs,
+                                                      chunk_size,
+                                                      low_th=thresholds['low_thresh'])
+    logger.info(f'Completed Cluster Means')
+    toc = time.perf_counter()
+    logger.info(f'Cluster Means Elapsed Time: {toc - tic}')
+
+    # Merge remaining clusters by differential expression
+    logger.info("Merging Clusters by DE")
+    tic = time.perf_counter()
+    merge_clusters_by_de(cluster_assignments_merge,
+                         cl_means,
+                         cl_vars,
+                         present_cl_means,
+                         cl_means_reduced,
+                         thresholds,
+                         k,
+                         de_method,
+                         )
+    logger.info(f'Completed Merging Clusters by DE')
+    toc = time.perf_counter()
+    logger.info(f'Merging DE Elapsed Time: {toc - tic}')
+
+    # Select marker genes
+    if return_markers_df is False and n_markers is None:
+        markers = None
+    else:
+        logger.info('Starting Marker Selection')
+        tic = time.perf_counter()
+        markers = select_marker_genes(
+            cluster_assignments=cluster_assignments_merge,
+            cluster_means=cl_means,
+            cluster_variances=cl_vars,
+            present_cluster_means=present_cl_means,
+            thresholds=thresholds,
+            n_markers=n_markers,
+            de_method=de_method,
+            return_markers_df=return_markers_df,
+            n_jobs=n_jobs
+        )
+        logger.info('Completed Marker Selection')
+        toc = time.perf_counter()
+        logger.info(f'Marker Selection Elapsed Time: {toc - tic}')
+
+
+    return cluster_assignments_merge, markers
+
+
+def merge_two_clusters(
+        cluster_assignments: Dict[Any, List],
+        label_source: Any,
+        label_dest: Any,
+        cluster_means: pd.DataFrame,
+        cluster_variances: Optional[pd.DataFrame]=None,
+        present_cluster_means: pd.DataFrame=None
+):
+    """
+    Merge source cluster into a destination cluster by:
+    1. updating cluster means and variances
+    2. updating mean of expressions present if not None
+    3. updating cluster assignments
+
+    Parameters
+    ----------
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    label_source:
+        label of cluster being merged
+    label_dest:
+        label of cluster merged into
+    cluster_means:
+        dataframe of cluster means indexed by cluster label
+    cluster_variances:
+        dataframe of cluster variances indexed by cluster label
+    present_cluster_means:
+        dataframe of cluster means indexed by cluster label filtered by low_th
+
+    Returns
+    -------
+    """
+
+    merge_cluster_means_vars(cluster_assignments, label_source, label_dest, cluster_means, cluster_variances)
+
+    if present_cluster_means is not None:
+        merge_cluster_means_vars(cluster_assignments, label_source, label_dest, present_cluster_means, None)
+
+    # merge cluster assignments
+    cluster_assignments[label_dest].extend(cluster_assignments[label_source])
+    cluster_assignments.pop(label_source)
+
+
+def merge_cluster_means_vars(
+        cluster_assignments: Dict[Any, List],
+        label_source: Any,
+        label_dest: Any,
+        cluster_means: pd.DataFrame,
+        cluster_variances: Optional[pd.DataFrame]
+):
+    """
+    Merge source cluster into a destination cluster by:
+    1. computing the updated cluster centroid (mean gene expression)
+        of the destination cluster
+    2. compute updated variance
+    3. deleting source cluster after merged
+
+    Parameters
+    ----------
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    label_source:
+        label of cluster being merged
+    label_dest:
+        label of cluster merged into
+    cluster_means:
+        dataframe of cluster means indexed by cluster label
+    cluster_variances:
+        dataframe of cluster variances indexed by cluster label
+
+    Returns
+    -------
+    """
+
+    # update cluster means:
+    n1 = len(cluster_assignments[label_source])
+    n2 = len(cluster_assignments[label_dest])
+    mean1 = cluster_means.loc[label_source]
+    mean2 = cluster_means.loc[label_dest]
+
+    mean_comb = (mean1 * n1 + mean2 * n2) / (n1 + n2)
+
+    cluster_means.loc[label_dest] = mean_comb
+    cluster_means.drop(label_source, inplace=True)
+
+    if cluster_variances is not None:
+        var1 = cluster_variances.loc[label_source]
+        var2 = cluster_variances.loc[label_dest]
+        
+        var_comb = 1 / (n1 + n2 - 1) * (
+            (n1 - 1) * var1 + n1 * (mean1 - mean_comb) ** 2 +
+            (n2 - 1) * var2 + n1 * (mean2 - mean_comb) ** 2
+        )
+
+        cluster_variances.loc[label_dest] = var_comb
+        cluster_variances.drop(label_source, inplace=True)
+
+
+def cdist_normalized(
+        X: np.ndarray,
+        Y: np.ndarray,
+) -> np.ndarray:
+    """
+    Calculate similarity metric as (1 - pairwise_distance/max_distance)
+
+    Parameters
+    ----------
+    X:
+        An m by n array of m clusters in an n-dimensional space
+    Returns
+    -------
+    similarity:
+        measure of similarity
+    """
+    similarity = cdist(X, Y, 'euclidean')
+    similarity /= np.max(similarity)
+    similarity *= -1
+    similarity += 1
+
+    return similarity
+
+
+def calculate_similarity(
+        cluster_means: pd.DataFrame,
+        group_rows: List[Any],
+        group_cols: List[Any]
+) -> pd.DataFrame:
+    """
+    Calculate similarity measure between two cluster groups (group_rows, group_cols)
+    based on cluster means (cluster centroids)
+    If data has more than 2 dimensions use correlation coefficient as a measure of similarity
+    else use normalized distance measure
+
+    Parameters
+    ----------
+    cluster_means:
+        Dataframe of cluster means with cluster labels as index
+    group_rows:
+        cluster group with clusters being merged
+    group_cols:
+        cluster group with destination clusters
+    Returns
+    -------
+    similarity:
+        array of similarity measure
+    """
+    source_means = cluster_means.loc[group_rows]
+    destination_means = cluster_means.loc[group_cols]
+
+    # #4 (bigcat alignment): use EUCLIDEAN distance on the reduced-space cluster means, matching R
+    # scrattch.bigcat get_knn_pairs (method="Annoy.Euclidean", sim = 1 - dist/max(dist) == cdist_normalized).
+    # The stock code used correlation distance for >2 dims, which fed the merge a DIFFERENT candidate-pair
+    # set than R. Euclidean here matches R's nearest-cluster selection for both the DE-merge candidates
+    # and the small-cluster pre-merge. (Ordering is invariant to the global 1-dist/max normalization.)
+    similarity = cdist_normalized(source_means, destination_means)
+
+    similarity_df = pd.DataFrame(
+        similarity,
+        index=group_rows,
+        columns=group_cols,
+        copy=False
+    )
+    for common in (set(group_rows) & set(group_cols)):
+        similarity_df.at[common, common] = np.nan
+
+    return similarity_df
+
+
+def find_most_similar(
+        similarity_df: pd.DataFrame,
+) -> Tuple[Any, Any, float]:
+    """
+
+    Parameters
+    ----------
+    similarity_df:
+        similarity metric between clusters
+    Returns
+    -------
+    source_label, dest_label, max_similarity:
+        labels of the source and destination clusters and their similarity value
+    """
+
+    similarity_df = similarity_df.transpose()
+
+    similarity_sorted = similarity_df.unstack().sort_values(ascending=False).dropna()
+    source_label, dest_label = similarity_sorted.index[0]
+    max_similarity = similarity_sorted[(source_label, dest_label)]
+
+    return source_label, dest_label, max_similarity
+
+
+def find_small_clusters(
+        cluster_assignments: Dict[Any, List],
+        min_size: int
+) -> List[Any]:
+
+    return [k for (k, v) in cluster_assignments.items() if len(v) < min_size]
+
+
+def merge_small_clusters(
+        cluster_means: pd.DataFrame,
+        cluster_assignments: Dict[Any, List],
+        min_size: int,
+):
+    """
+    Then merge small clusters (with size < min_size) iteratively as:
+
+    1. calculate similarity between small and all clusters
+    2. merge most-highly similar small cluster
+    3. update list of small/all clusters
+    4. go to 1 until all small clusters are merged
+
+    Parameters
+    ----------
+    cluster_means:
+        dataframe of cluster means indexed by cluster label
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    min_size:
+        smallest size that is not merged
+
+    Returns
+    -------
+    cluster_assignments:
+        updated mapping of cluster assignments
+    """
+    all_cluster_labels = list(cluster_assignments.keys())
+    small_cluster_labels = find_small_clusters(cluster_assignments, min_size=min_size)
+
+    while small_cluster_labels:
+        if len(cluster_assignments.keys()) == 1:
+            break
+
+        similarity_small_to_all_df = calculate_similarity(
+            cluster_means,
+            group_rows=small_cluster_labels,
+            group_cols=all_cluster_labels)
+
+        source_label, dest_label, max_similarity = find_most_similar(
+            similarity_small_to_all_df,
+        )
+        logger.debug(f"Merging small cluster {source_label} into {dest_label} -- similarity: {max_similarity}")
+        merge_two_clusters(cluster_assignments, source_label, dest_label, cluster_means)
+
+        # update labels:
+        small_cluster_labels = find_small_clusters(cluster_assignments, min_size=min_size)
+        all_cluster_labels = list(cluster_assignments.keys())
+
+
+
+def merge_clusters_by_de(
+    cluster_assignments: Dict[Any, List],
+    cluster_means: pd.DataFrame,
+    cluster_variances: pd.DataFrame,
+    present_cluster_means: pd.DataFrame,
+    cluster_means_rd: pd.DataFrame,
+    thresholds: Dict[str, Any],
+    k: Optional[int] = 2,
+    de_method: Optional[Literal['ebayes', 'chisq']] = 'ebayes',
+):
+    """
+    Merge clusters by the calculated gene differential expression score
+
+    1. get k nearest clusters for each cluster in a reduced space
+    2. calculate differential expression scores for all pairs
+    3. sort scores by lowest and loop through them, merging pairs with scores lower than threshold
+
+    Parameters
+    ----------
+    cluster_assignments:
+        map of cluster label to cell idx belonging to cluster
+    cluster_means:
+        dataframe of cluster means indexed by cluster label in a normalized space
+    cluster_variances:
+        dataframe of cluster variances indexed by cluster label in a normalized space
+    present_cluster_means:
+        dataframe of cluster means indexed by cluster label filtered by low_th in a normalized space
+    cluster_means_rd:
+        dataframe of cluster means indexed by cluster label in a reduced space
+    k:
+        number of cluster neighbors
+    de_method:
+        method used for de calculation
+    thresholds:
+        threshold use de calculation
+
+    Returns
+    -------
+    cluster_assignments:
+        updated mapping of cluster assignments
+    """
+    cl_size = {k: len(v) for k, v in cluster_assignments.items()}
+
+    thresholds = thresholds.copy()
+    score_th = thresholds.pop('score_thresh')
+    min_genes = thresholds.pop('min_genes')
+    thresholds.pop('low_thresh')
+    # max_cl_size caps the cells/cluster used in the DE test (matching scrattch.bigcat max.cl.size).
+    # DISABLED by default (None) -> use ALL cells per cluster, matching R with max.cl.size=Inf.
+    # Set an integer in merge_clusters_kwargs.thresholds['max_cl_size'] to re-enable the cap.
+    max_cl_size = thresholds.pop('max_cl_size', None)
+    # merge_mode:
+    #   'aligned' (default) - R-faithful: re-examine ALL clusters' k-nearest each round, merge the single
+    #      lowest-score pair + extras only < score_th/2, recompute. Highest fidelity to scrattch.bigcat,
+    #      but slow (many rounds).
+    #   'fast' - previous behavior: after round 1 only re-examine merged-destination clusters' neighbors,
+    #      and merge EVERY non-conflicting candidate < score_th per round. Far fewer rounds -> much faster.
+    merge_mode = thresholds.pop('merge_mode', 'aligned')
+
+    # DE-score cache keyed by frozenset(pair) -> {'score', 'num'} (mirrors R merge_cl_big's `de.genes`
+    # cache: pairs are recomputed only when new; entries touching a merged cluster are invalidated).
+    de_cache: Dict[frozenset, Dict[str, float]] = {}
+    half_th = score_th / 2.0
+    merged_cluster_dsts = None
+    while len(cluster_assignments.keys()) > 1:
+        # 'aligned' re-examines the k nearest clusters of EVERY cluster each round (like R get_knn_pairs);
+        # 'fast' only re-examines merged-destination clusters' neighbors after round 1 (previous behavior).
+        scope = None if merge_mode == 'aligned' else merged_cluster_dsts
+        logger.info(f"Getting {k} nearest clusters")
+        neighbor_pairs = order_pairs(get_k_nearest_clusters(cluster_means_rd, scope, k))
+        # dedupe to unique unordered pairs
+        seen = set(); uniq_pairs = []
+        for p in neighbor_pairs:
+            key = frozenset(p)
+            if key not in seen and len(key) == 2:
+                seen.add(key); uniq_pairs.append(p)
+        neighbor_pairs = uniq_pairs
+        logger.info(f"Completed {k} nearest clusters")
+        if len(neighbor_pairs) == 0:
+            break
+
+        # Step 4: compute DE only for pairs not already cached (matching R's `new.pairs`)
+        to_compute = [p for p in neighbor_pairs if frozenset(p) not in de_cache]
+        if to_compute:
+            logger.info(f"Calculating de scores for {len(to_compute)} new pairs using {de_method}")
+            # per-cluster cell counts for the DE test; if max_cl_size is None the cap is DISABLED
+            # (use all cells), else cap at max_cl_size (recomputed each round so merged clusters re-cap)
+            cl_size_de = cl_size if max_cl_size is None else {c: min(n, max_cl_size) for c, n in cl_size.items()}
+            if de_method == 'ebayes':
+                new_scores = tc.de_pairs_ebayes(
+                    to_compute, cluster_means, cluster_variances,
+                    present_cluster_means, cl_size_de, thresholds,
+                )
+            elif de_method == 'chisq':
+                new_scores = tc.de_pairs_chisq(
+                    to_compute, cluster_means, present_cluster_means, cl_size_de, thresholds,
+                )
+            else:
+                raise ValueError(f'Unknown de_method {de_method}, must be one of [chisq, ebayes]')
+            for pr, row in new_scores.iterrows():
+                de_cache[frozenset(pr)] = {'score': float(row.score), 'num': float(row.num)}
+
+        # Candidate pairs = R test_merge: score < score_th OR num < min_genes  (#3: strict <)
+        candidates = []
+        for p in neighbor_pairs:
+            d = de_cache[frozenset(p)]
+            if d['score'] < score_th or d['num'] < min_genes:
+                candidates.append((p, d['score']))
+        if len(candidates) == 0:
+            break
+        candidates.sort(key=lambda x: x[1])   # ascending by score
+
+        # Merge acceptance:
+        #   'aligned': merge the single lowest-score pair unconditionally + extras only < score_th/2 (#1).
+        #   'fast':    merge EVERY non-conflicting candidate this round (previous behavior).
+        merged_clusters = set()
+        merged_cluster_dsts = set()
+        logger.info("Merging clusters by DE score")
+        for i, (pair, score) in enumerate(candidates):
+            dst_label, src_label = pair
+            if merge_mode == 'aligned' and i != 0 and not (score < half_th):
+                continue
+            if dst_label in merged_clusters or src_label in merged_clusters:
+                continue
+
+            logger.debug(f"Merging cluster {src_label} into {dst_label} -- de score: {score}")
+            # Update cluster means on reduced space, then normalized space + assignments
+            merge_cluster_means_vars(cluster_assignments, src_label, dst_label, cluster_means_rd, None)
+            merge_two_clusters(cluster_assignments, src_label, dst_label, cluster_means, cluster_variances, present_cluster_means)
+            merged_clusters.add(src_label)
+            merged_clusters.add(dst_label)
+            merged_cluster_dsts.add(dst_label)
+            cl_size[dst_label] += cl_size[src_label]
+            cl_size.pop(src_label)
+
+        if not merged_clusters:
+            break   # nothing merged this round -> converged
+        # invalidate cached scores for any pair touching a merged cluster (means changed)
+        for key in [key for key in de_cache if key & merged_clusters]:
+            del de_cache[key]
+
+
+
+def get_k_nearest_clusters(
+        cluster_means: pd.DataFrame,
+        cluster_labels: Optional[Set[Any]] = None,
+        k: Optional[int] = 2
+) -> List[Tuple[int, int]]:
+    """
+    Get k nearest neighbors for each cluster
+
+    Parameters
+    ----------
+    cluster_means:
+        dataframe of cluster means with cluster labels as index
+    cluster_labels:
+        clusters to calculate nearest neighbors for. If none will return all
+    k:
+        number of nearest neighbors
+
+    Returns
+    -------
+    nearest_neighbors:
+        list of cluster pairs
+    """
+
+    all_cluster_labels = list(cluster_means.index)
+    if cluster_labels is None:
+        cluster_labels = all_cluster_labels
+    else:
+        cluster_labels = list(cluster_labels)
+
+    if k >= len(all_cluster_labels):
+        logger.debug("k cannot be greater than or the same as the number of clusters. "
+                          "Defaulting to number of clusters - 1.")
+        k = len(all_cluster_labels) - 1
+
+    similarity = calculate_similarity(
+            cluster_means,
+            group_rows=all_cluster_labels,
+            group_cols=cluster_labels)
+
+    similarity = similarity.unstack().dropna()
+
+    # Get k nearest neighbors
+    nearest_neighbors = set()
+    for c in cluster_labels:
+        # Sort similarities for a cluster
+        sorted_similarities = similarity.loc[(c, )].sort_values(ascending=False)
+
+        for i in range(k):
+            neighbor_cl = sorted_similarities.index[i]
+
+            # Make sure neighbor doesn't already exist
+            if not (neighbor_cl, c) in nearest_neighbors:
+                nearest_neighbors.add((c, neighbor_cl))
+
+    return list(nearest_neighbors)
+
+
+def order_pairs(
+        neighbor_pairs: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """
+    Order each label such that smaller label is follower by a larger
+    e.g: (3,8), (6,7)
+
+    Parameters
+    ----------
+    neighbor_pairs:
+        list of neighbor pairs
+
+    Returns
+    -------
+    ordered list of neighbor pairs
+    """
+    ordered_pairs = []
+
+    for p in neighbor_pairs:
+        a, b = p
+        if b > a:
+            ordered_pairs.append((a, b))
+        else:
+            ordered_pairs.append((b, a))
+
+    return ordered_pairs
+
+
+def get_cluster_assignments(
+        adata: ad.AnnData,
+        cluster_label_obs: str = "pheno_louvain"
+) -> Dict[Any, List]:
+    """
+
+    Parameters
+    ----------
+    adata:
+        AnnData object with with obs including cluster label
+    cluster_label_obs:
+        cluster label annotations in adata.obs
+
+    Returns
+    -------
+    cluster_assignments:
+        map of cluster label to cell idx
+    """
+    if cluster_label_obs not in list(adata.obs):
+        raise ValueError(f"column {cluster_label_obs} is missing from obs")
+
+    cluster_assignments = defaultdict(list)
+    for i, label in enumerate(adata.obs[cluster_label_obs]):
+        cluster_assignments[label].append(i)
+
+    return cluster_assignments
