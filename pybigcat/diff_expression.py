@@ -8,8 +8,27 @@ import statsmodels.stats.multitest as multi
 import warnings
 import logging
 import sys
+import gc
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def no_gc_collect():
+    """
+    Temporarily make gc.collect() a no-op. statsmodels' multipletests() calls gc.collect() on EVERY
+    call; in the per-pair DE loops (merge / de_all_pairs / marker selection) that triggers a full
+    garbage collection thousands of times and dominates runtime (~10x slowdown). Wrapping the
+    multipletests call in this context neutralizes those explicit collects (gc.disable() does not,
+    since the call is explicit). Restores gc.collect on exit, so it is exception-safe and global-safe.
+    """
+    _orig = gc.collect
+    gc.collect = lambda *a, **k: 0
+    try:
+        yield
+    finally:
+        gc.collect = _orig
 
 def vec_chisq_test(pair: tuple,
                   cl_present: pd.DataFrame,
@@ -102,7 +121,8 @@ def de_pair_chisq(pair: tuple,
                             cl_present_sorted,
                             cl_size)
     
-    reject, p_adj, alphacSidak, alphacBonf = multi.multipletests(p_vals, method="holm", is_sorted=False)
+    with no_gc_collect():
+        reject, p_adj, alphacSidak, alphacBonf = multi.multipletests(p_vals, method="holm", is_sorted=False)
     lfc = cl_means_sorted.loc[first_cluster].to_numpy() - cl_means_sorted.loc[second_cluster].to_numpy()
 
     q1 = cl_present_sorted.loc[first_cluster].to_numpy()
